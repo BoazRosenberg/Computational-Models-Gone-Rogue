@@ -1,0 +1,802 @@
+---
+title: "Asymmetric learning model gone rogue"
+author: "Boaz Rosenberg"
+date: "`r Sys.Date()`"
+output: 
+    rmdformats::material:
+       self_contained: true
+       thumbnail: false
+       lightbox: true
+       gallery: true
+       fig_width: 10
+       fig_caption: yes
+
+---
+
+
+```{r setup, include=FALSE}
+{
+knitr::opts_chunk$set(warning = FALSE,   echo = FALSE,
+                      fig.path = "Figures/",
+                      dpi = 400)
+
+library(tidyverse)
+library(ggplot2)
+library(ks)
+library(plotly)
+library(DT)
+library(readr)
+library(rstan)
+library(bayesplot)
+library(tibble)
+library(knitr)
+library(HDInterval)
+library(viridisLite)
+library(HDInterval)
+
+} # setups
+
+fit_dir  = file.path("Model Fitting","Fit Models")
+data_dir = file.path("Data Simulation","Simulated Data")
+RDS_dir  = file.path("Simulations and Analysis", "RDS files")
+
+{
+custom_theme = theme_bw(base_size = 14) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, size = 1),  # black outline
+    panel.background = element_rect(fill = "white", color = NA),         # white background
+    panel.grid.minor = element_blank(),                                  # remove minor grid lines
+    legend.position = "none",
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+} # Custom Theme
+
+{
+  param_colors <- c(
+  lr       = "#2772ab",
+  lr_pos   = "#7eb4e0",
+  lr_neg   = "#0f446e",
+  
+  inv_temp = "#c9939b",
+  bias     = "#69995D"
+)
+  
+model_colors <- c(
+  "Constant LR" = "#3ca1c9",
+  "Asymmetric LR" = "#69995D",
+  "Diminishing LR" = "#bb75f0",
+  "Random" = "grey70"
+)
+
+} # Colors
+
+
+
+
+{
+  extract_subject_param <- function(fit, param_name) {
+  library(rstan)
+
+  arr <- rstan::extract(fit, pars = param_name, permuted = FALSE)
+
+  dim_arr <- dim(arr)
+  n_iter <- dim_arr[1]
+  n_chain <- dim_arr[2]
+  n_subj <- dim_arr[3]
+
+  df <- expand.grid(
+    iter = 1:n_iter,
+    chain = 1:n_chain,
+    subject = 1:n_subj
+  )
+
+  df$value <- as.vector(arr)
+
+  return(df)
+}
+  
+  extract_hyper_param  <- function(fit, index) {
+  library(rstan)
+  
+  mu_samples <- rstan::extract(fit, pars = "mu", permuted = TRUE)[[1]]
+  sigma_samples <- rstan::extract(fit, pars = "sigma", permuted = TRUE)[[1]]
+  
+  mu_vec <- mu_samples[, index]
+  sigma_vec <- sigma_samples[, index]
+  
+  df <- data.frame(
+    draw = 1:length(mu_vec),
+    mu = mu_vec,
+    sigma = sigma_vec
+  )
+  
+  return(df)
+}
+  
+  
+} # Parameter extraction functions
+{
+  
+# Logit function: log(p / (1-p))
+logit <- function(p) {
+  if(any(p <= 0 | p >= 1)) warning("p should be in (0,1)")
+  log(p / (1 - p))
+}
+
+# Inverse logit function: 1 / (1 + exp(-x))
+inv_logit <- function(x) {
+  1 / (1 + exp(-x))
+}
+} # Additional functions
+```
+
+
+# General information
+
+```{r load data, message = F}
+{
+Case_1_data = read_csv(file.path(data_dir, "Case_1.csv"))
+Case_2_data = read_csv(file.path(data_dir, "Case_2.csv"))
+Case_2_extra_opposing = read_csv(file.path(data_dir, "Case_2_extra_opposing.csv"))
+Case_2_extra_random = read_csv(file.path(data_dir, "Case_2_extra_random.csv"))
+} #  load simulated data
+
+{
+  data_summ = bind_rows(Case_1_data %>% mutate(source= "Case_1"),
+                        Case_2_data %>% mutate(source= "Case_2"),
+                        Case_2_extra_opposing %>% mutate(source= "Case_2_opposing"),
+                        Case_2_extra_random %>% mutate(source= "Case_2_random")) %>%
+    group_by(source) %>% 
+    summarise(n_subj = max(subject),
+            n_trials = max(trial),
+            n_blocks = max(block))
+
+} # data summary
+```
+
+```{r data summaries}
+datatable(data_summ)
+```
+
+# Case 1 {.tabset}
+
+```{r load model fits case 1}
+Case_1_const = readRDS(file.path(fit_dir,"Case_1_const.rds"))
+Case_1_dim = readRDS(file.path(fit_dir,"Case_1_dim.rds"))
+Case_1_true = readRDS(file.path(fit_dir,"Case_1_true.rds"))
+
+
+# Parameter dfs
+Case_1_const_lr       = extract_hyper_param(Case_1_const,1) %>% mutate(lr = inv_logit(mu))
+Case_1_const_inv_temp = extract_hyper_param(Case_1_const,2) %>% mutate(inv_temp = exp(mu))
+Case_1_dim_inv_temp = extract_hyper_param(Case_1_dim,1) %>% mutate(inv_temp = exp(mu))
+```
+
+## General fit stats
+
+```{r general fit stats}
+summarize_models <-function(fit_list, rhat_thresh = 1.01) {
+  
+  imap(fit_list, function(fit, model_name) {
+    
+    summ <- summary(fit)$summary
+    
+    rhat_vals <- summ[, "Rhat"]
+    ess_vals  <- summ[, "n_eff"]
+    
+    sampler <- get_sampler_params(fit, inc_warmup = FALSE)
+    
+    # total iterations
+    n_iter <- sum(sapply(sampler, nrow))
+    
+    # divergences
+    n_div <- sum(sapply(sampler, function(x) sum(x[, "divergent__"])))
+    
+    # treedepth hits
+    n_treedepth <- sum(sapply(sampler, function(x) {
+      max_td <- max(x[, "treedepth__"])
+      sum(x[, "treedepth__"] == max_td)
+    }))
+    
+    tibble(
+      Metric = c(
+        "Rhat (max)",
+        "ESS (min)",
+        "ESS (median)",
+        "Divergences",
+        "Divergence rate (%)",
+        "Treedepth hits",
+        "% Rhat > 1.01"
+      ),
+      !!model_name := c(
+        max(rhat_vals, na.rm = TRUE),
+        min(ess_vals, na.rm = TRUE),
+        median(ess_vals, na.rm = TRUE),
+        n_div,
+        (n_div / n_iter) * 100,
+        n_treedepth,
+        mean(rhat_vals > rhat_thresh, na.rm = TRUE) * 100
+      )
+    )
+  }) %>%
+    reduce(full_join, by = "Metric")
+}
+
+fit_list <- list(
+  constant = Case_1_const,
+  diminishing  = Case_1_dim,
+  true = Case_1_true
+)
+
+fit_summary <- summarize_models(fit_list)
+
+datatable(fit_summary %>% mutate(across(-Metric, round, 3)),
+          caption = "Model Convergence Diagnostics")
+```
+
+## Model Comparison 
+
+```{r Fig 1a, fig.height= 5, fig.width = 5}
+Case_1_const_bridge <- readRDS(file.path(fit_dir,"Case_1_const_bridge.rds"))
+Case_1_dim_bridge <- readRDS(file.path(fit_dir,"Case_1_dim_bridge.rds"))
+Case_1_true_bridge <- readRDS(file.path(fit_dir,"Case_1_true_bridge.rds"))
+
+log_BF = Case_1_const_bridge$logml - Case_1_dim_bridge$logml
+
+random_log_ml = data_summ %>% filter(source == "Case_1") %>%
+  mutate(n_decisions = n_subj * n_trials * n_blocks) %>%
+  pull(n_decisions) *log(0.5)
+
+bf_report <- tibble(
+  model = c("Constant LR", "Diminishing LR", "True Model", "Random"),
+  log_ml = c(Case_1_const_bridge$logml,Case_1_dim_bridge$logml,Case_1_true_bridge$logml,random_log_ml)) %>%
+  mutate(delta_log_ml = round(log_ml - random_log_ml,1),
+         log_ml = round(log_ml,1)) %>%
+  arrange(log_ml) %>%
+  mutate(model = factor(model, levels = model))
+
+datatable(bf_report)
+
+ggplot(bf_report %>% filter(model %in% c("Diminishing LR","Constant LR")),
+       aes(y = delta_log_ml, x = model, fill = model)) +
+  geom_col() +
+  labs( y = "Log Marginal Likelihood Relative to Random",
+        x = NULL) +
+  scale_fill_manual(values = model_colors) +
+  custom_theme+
+  theme(legend.position = "none")
+
+```
+
+
+## Parameters {.tabset}
+
+### Table 
+
+```{r Case 1 parameter table}
+
+Case_1_const_lr_hdi       <- hdi(Case_1_const_lr$lr)
+Case_1_const_inv_temp_hdi <- hdi(Case_1_const_inv_temp$inv_temp)
+Case_1_dim_inv_temp_hdi   <- hdi(Case_1_dim_inv_temp$inv_temp)
+
+Case_1_hdi = data.frame(Model    = c("Constant LR", "Constant LR", "Diminishing LR"),
+                        Parameter = c("Learning Rate", "Inv Temp", "Inv Temp"),
+                        Lower     = c(Case_1_const_lr_hdi[1], Case_1_const_inv_temp_hdi[1], Case_1_dim_inv_temp_hdi[1]),
+                        Upper     = c(Case_1_const_lr_hdi[2], Case_1_const_inv_temp_hdi[2], Case_1_dim_inv_temp_hdi[2]))
+
+datatable(Case_1_hdi %>% mutate(across(where(is.numeric), round, 3)),
+          rownames = FALSE)
+
+```
+
+### Plots
+
+```{r plot function}
+
+plot_hdi = function(draw_vec,hdi,param_name, xlim = NULL, true_scale = NULL){
+  
+  y_scale = density(draw_vec)$y %>% max()
+  df = data.frame(x= draw_vec)
+
+  p = ggplot() +
+    geom_density( data = df,aes(x = x),fill = param_colors[param_name], alpha = 0.5 , col = NA)+
+    geom_errorbarh(aes(xmin = hdi[1], xmax = hdi[2], y = 0), height = y_scale * 0.05, linewidth = 1) +
+    annotate("text", x = mean(draw_vec), y = y_scale/15, label = "95% HDI") +
+    labs( x = param_name,
+          y = "Density") +
+    custom_theme
+  
+  if (!is.null(true_scale)) {
+    p = p +  geom_errorbarh(aes(xmin = true_scale[1], xmax = true_scale[2], y = y_scale*0),
+                             height = y_scale*0.05, linewidth = 1, col = param_colors[param_name])
+  }
+
+  if (!is.null(xlim)) {
+    p = p + coord_cartesian(xlim = xlim)
+  }
+
+  return(p)
+  
+}
+
+plot_hdi_double = function(draw_vec_1,hdi_1,param_name_1, 
+                           draw_vec_2,hdi_2,param_name_2, 
+                           x_axis_label,
+                           xlim = NULL, true_scale = NULL){
+  
+  y_scale = density(draw_vec_1)$y %>% max() %>%
+        max(density(draw_vec_2)$y %>% max())
+
+  df = data.frame(x1 = draw_vec_1,
+                  x2 = draw_vec_2)
+
+  p = ggplot() +
+    geom_density( data = df,aes(x = x1),fill = param_colors[param_name_1], alpha = 0.5 , col = NA)+
+    geom_density( data = df,aes(x = x2),fill = param_colors[param_name_2], alpha = 0.5 , col = NA)+
+    
+    geom_errorbarh(aes(xmin = hdi_1[1], xmax = hdi_1[2], y = 0), height = y_scale * 0.05, linewidth = 1) +
+    geom_errorbarh(aes(xmin = hdi_2[1], xmax = hdi_2[2], y = 0), height = y_scale * 0.05, linewidth = 1) +
+    
+    annotate("text", x = mean(draw_vec_1), y = y_scale/15, label = "95% HDI") +
+    annotate("text", x = mean(draw_vec_2), y = y_scale/15, label = "95% HDI") +
+    
+    labs( x = x_axis_label,
+          y = "Density") +
+    
+    coord_cartesian(xlim = xlim) +
+    custom_theme
+  
+
+  if (!is.null(xlim)) {
+    p = p + coord_cartesian(xlim = xlim)
+  }
+
+  return(p)
+  
+}
+
+```
+
+```{r fig1b,  fig.width=8, fig.height=4}
+
+plot_hdi(Case_1_const_lr$lr, Case_1_const_lr_hdi,"lr", xlim = c(0,0.2), true_scale = c(1/30,0.2))
+
+# True scale is actually 1/30 to 1. The plot would be processed as a png to add gap in x axis
+
+```
+
+```{r fig1c,  fig.width=8, fig.height=4}
+
+plot_hdi(Case_1_const_inv_temp$inv_temp, Case_1_const_inv_temp_hdi,"inv_temp", true_scale = c(0.2,0.2*30))
+
+```
+
+## PPC {.tabset}
+
+### Accuracy
+```{r fig1b PPC1, fig.width=8, fig.height=4}
+
+acc_ppc_case_1 = readRDS(file = file.path(RDS_dir,"acc_ppc_case_1.rds"))
+
+{
+  
+PPC1_block_summ = Case_1_data %>%
+  group_by(subject, block) %>%
+  summarise(b1 = mean(b1),
+            b2 = mean(b2)) %>%
+  mutate(b1_better = b1 > b2)
+
+PPC1_data = Case_1_data %>%
+  left_join(PPC1_block_summ  %>% select(subject,block, b1_better)) %>%
+  mutate(correct = as.integer(b1_better) == choice ) 
+
+
+PPC1_trial_summ = PPC1_data %>%
+  group_by(trial) %>%
+  summarise(accuracy = mean(correct))
+} # PPC data
+
+{
+  ggplot(acc_ppc_case_1 %>% filter(model != "True"),
+         aes(x = trial, y = mean, color = model, fill = model)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, color = NA) +
+    geom_line(linewidth = 1) +
+    geom_point(data = PPC1_trial_summ, aes(x = trial, y = accuracy), 
+               inherit.aes = FALSE, color = "black", size = 2) +
+    custom_theme +
+    scale_color_manual(values = model_colors)+
+    scale_fill_manual(values = model_colors)+
+    labs(y = "Mean Accuracy",
+         x = "Trial")
+  } # plot
+
+```
+
+# Stay Probability
+
+```{r PPC1_stay, fig.width=8, fig.height=4}
+stay_ppc_case_1 = readRDS(file = file.path(RDS_dir,"stay_ppc_case_1.rds"))
+
+{
+
+true_stay_p_case_1 = Case_1_data %>%
+    group_by(block) %>%
+    mutate(stay = choice == lag(choice)) %>%
+    ungroup() %>%
+    summarise(stay_p = mean(stay,na.rm = T))
+
+} # true stay p
+
+{
+  
+  ggplot(stay_ppc_case_1%>% filter(model != "True"))+ 
+    geom_vline(xintercept = true_stay_p_case_1$stay_p, linetype = 2)+
+    geom_histogram(aes(x = general, fill = model),alpha = 0.5, position = "identity",)+
+    custom_theme+  
+    scale_fill_manual(values = model_colors)+
+    scale_color_manual(values = model_colors)+
+    labs(y = "Density",
+         x = "Stay Probability")
+  
+
+  } # plot
+
+```
+
+
+# Case 2 {.tabset}
+
+```{r load model fits case 2}
+Case_2_const = readRDS(file.path(fit_dir,"Case_2_const.rds"))
+Case_2_asymm = readRDS(file.path(fit_dir,"Case_2_asymm.rds"))
+Case_2_true = readRDS(file.path(fit_dir,"Case_2_true.rds"))
+
+
+# Parameter dfs
+Case_2_const_lr       = extract_hyper_param(Case_2_const,1) %>% mutate(lr = inv_logit(mu))
+Case_2_const_inv_temp = extract_hyper_param(Case_2_const,2) %>% mutate(inv_temp = exp(mu))
+
+Case_2_asymm_lr_pos   = extract_hyper_param(Case_2_asymm,1) %>% mutate(lr_pos = inv_logit(mu))
+Case_2_asymm_lr_neg   = extract_hyper_param(Case_2_asymm,2) %>% mutate(lr_neg = inv_logit(mu))
+Case_2_asymm_inv_temp = extract_hyper_param(Case_2_asymm,3) %>% mutate(inv_temp = exp(mu))
+
+Case_2_asymm_bias     = full_join(Case_2_asymm_lr_pos %>% select(draw,lr_pos),
+                                  Case_2_asymm_lr_neg %>% select(draw,lr_neg)) %>%
+  mutate(bias = lr_pos / (lr_pos + lr_neg))
+```
+
+## General fit stats
+
+```{r general fit stat case 2}
+
+fit_list <- list(
+  constant = Case_2_const,
+  asymm  = Case_2_asymm,
+  true = Case_2_true
+)
+
+fit_summary <- summarize_models(fit_list)
+
+datatable(fit_summary %>% mutate(across(-Metric, round, 3)),
+          caption = "Model Convergence Diagnostics")
+
+```
+
+
+## Model Comparson 
+
+```{r Fig 2c, fig.height= 5, fig.width = 5}
+
+Case_2_const_bridge <- readRDS(file.path(fit_dir,"Case_2_const_bridge.rds"))
+Case_2_asymm_bridge <- readRDS(file.path(fit_dir,"Case_2_asymm_bridge.rds"))
+Case_2_true_bridge <- readRDS(file.path(fit_dir,"Case_2_true_bridge.rds"))
+
+log_BF = Case_2_const_bridge$logml - Case_2_asymm_bridge$logml
+
+random_log_ml = data_summ %>% filter(source == "Case_2") %>%
+  mutate(n_decisions = n_subj * n_trials * n_blocks) %>%
+  pull(n_decisions) *log(0.5)
+
+bf_report_Case_2 <- tibble(
+  model = c("Constant LR", "Asymmetric LR", "True Model", "Random"),
+  log_ml = c(Case_2_const_bridge$logml,Case_2_asymm_bridge$logml,Case_2_true_bridge$logml,random_log_ml)) %>%
+  mutate(delta_log_ml = round(log_ml - random_log_ml,1),
+         log_ml = round(log_ml,1)) %>%
+  arrange(log_ml) %>%
+  mutate(model = factor(model, levels = model))
+
+datatable(bf_report_Case_2)
+
+ggplot(bf_report_Case_2 %>% filter(model %in% c("Asymmetric LR","Constant LR","True Model")),
+       aes(y = delta_log_ml, x = model, fill = model)) +
+  geom_col() +
+  labs( y = "Log Marginal Likelihood Relative to Random",
+        x = NULL) +
+  scale_fill_manual(values =  c( "Asymmetric LR" = model_colors[["Asymmetric LR"]],
+                                 "Constant LR"   = model_colors[["Constant LR"]],
+                                 "True Model"    = model_colors[["Diminishing LR"]] )) +
+  custom_theme +
+  theme(legend.position = "none")
+
+
+
+```
+
+## Parameters {.tabset}
+
+### Table
+
+```{r case 2 parameter table}
+
+Case_2_const_lr_hdi =       hdi(Case_2_const_lr$lr)
+Case_2_const_inv_temp_hdi = hdi(Case_2_const_inv_temp$inv_temp)
+
+Case_2_asymm_lr_pos_hdi =   hdi(Case_2_asymm_lr_pos$lr_pos)
+Case_2_asymm_lr_neg_hdi =   hdi(Case_2_asymm_lr_neg$lr_neg)
+Case_2_asymm_inv_temp_hdi = hdi(Case_2_asymm_inv_temp$inv_temp)
+
+Case_2_asymm_bias_hdi =  hdi(Case_2_asymm_bias$bias)
+
+Case_2_hdi = data.frame(Model = c("Constant LR", "Constant LR","Asymmetric LR", "Asymmetric LR","Asymmetric LR", "Asymmetric LR"),
+                        Parameter = c("Learning Rate", "Inv Temp","LR Positive", "LR Negative", "Inv Temp", "Bias"),
+                        Lower = c(Case_2_const_lr_hdi[1], Case_2_const_inv_temp_hdi[1], Case_2_asymm_lr_pos_hdi[1], Case_2_asymm_lr_neg_hdi[1], Case_2_asymm_inv_temp_hdi[1], Case_2_asymm_bias_hdi[1]),
+                        Upper = c(Case_2_const_lr_hdi[2], Case_2_const_inv_temp_hdi[2], Case_2_asymm_lr_pos_hdi[2], Case_2_asymm_lr_neg_hdi[2], Case_2_asymm_inv_temp_hdi[2], Case_2_asymm_bias_hdi[2]))
+
+datatable(Case_2_hdi %>% mutate(across(where(is.numeric), round, 3)),
+          rownames = FALSE)
+
+```
+
+
+### Plots
+
+```{r Fig2a,  fig.width=8, fig.height=4}
+
+plot_hdi_double(Case_2_asymm_bias$lr_pos, Case_2_asymm_lr_pos_hdi,"lr_pos",
+                Case_2_asymm_bias$lr_neg, Case_2_asymm_lr_neg_hdi,"lr_neg",
+                x_axis_label = "Learning Rate",
+                xlim = c(0,1))
+```
+
+```{r Fig2b,  fig.width=8, fig.height=4}
+
+plot_hdi(Case_2_asymm_bias$bias, Case_2_asymm_bias_hdi,"bias", xlim = c(0,1))+
+  geom_vline(xintercept = 0.5, linetype = 2)
+
+```
+
+
+## PPC {.tabset}
+
+### Accuracy
+
+```{r PPC2_acc, fig.width=8, fig.height=4}
+acc_ppc_case_2 = readRDS(file = file.path(RDS_dir,"acc_ppc_case_2.rds"))
+
+{
+  
+PPC2_block_summ = Case_2_data %>%
+  group_by(subject, block) %>%
+  summarise(b1 = mean(b1),
+            b2 = mean(b2)) %>%
+  mutate(b1_better = b1 > b2)
+
+PPC2_data = Case_2_data %>%
+  left_join(PPC2_block_summ  %>% select(subject,block, b1_better)) %>%
+  mutate(correct = as.integer(b1_better) == choice ) 
+
+
+PPC2_trial_summ = PPC2_data %>%
+  group_by(trial) %>%
+  summarise(accuracy = mean(correct))
+} # data
+
+{
+  
+  ggplot(acc_ppc_case_2 %>% filter(model != "True"),
+         aes(x = trial, y = mean, color = model, fill = model)) +
+    geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, color = NA) +
+    geom_line(linewidth = 1) +
+    geom_point(data = PPC2_trial_summ, aes(x = trial, y = accuracy), 
+               inherit.aes = FALSE, color = "black", size = 2) +
+    custom_theme +
+    scale_color_manual(values = model_colors)+
+    scale_fill_manual(values = model_colors)+
+    labs(y = "Mean Accuracy",
+         x = "Trial")
+  } # plot
+
+```
+
+### Stay probability
+
+```{r PPC2_stay, fig.width=8, fig.height=4}
+stay_ppc_case_2 = readRDS(file = file.path(RDS_dir,"stay_ppc_case_2.rds"))
+
+{
+
+true_stay_p_case_2 = Case_2_data %>%
+    group_by(block) %>%
+    mutate(stay = choice == lag(choice)) %>%
+    ungroup() %>%
+    summarise(stay_p = mean(stay,na.rm = T))
+
+} # true stay p
+
+{
+  
+  ggplot(stay_ppc_case_2%>% filter(model != "True"))+ 
+    geom_vline(xintercept = true_stay_p_case_2$stay_p, linetype = 2)+
+    geom_histogram(aes(x = general, fill = model),alpha = 0.5, position = "identity",)+
+    custom_theme+  
+    scale_fill_manual(values = model_colors)+
+    scale_color_manual(values = model_colors)+
+    labs(y = "Density",
+         x = "Stay Probability")
+  
+
+  } # plot
+
+```
+
+
+## Simulations
+
+```{r Fig2ef , fig.width= 5, fig.height=5}
+
+sim_case_2 = readRDS(file.path(RDS_dir,"sim_case_2.rds")) %>%
+  mutate(model = factor(model, labels = c("Asymmetric LR","Constant LR","Diminishing LR")))
+
+
+{
+  ggplot(sim_case_2 %>% 
+          select(model, trial, update_pos, update_neg) %>% 
+          gather(key = "direction", value = "update", update_pos, update_neg) %>%
+          mutate(direction = factor(direction, levels = c("update_pos", "update_neg"))),
+        aes(x = trial, col = model))+
+    geom_line(aes(y = abs(update)), linewidth = 1) +
+     scale_color_manual(values = model_colors)+
+  facet_grid(direction~.)+
+  labs(x = "block")+
+  lims(x = c(1,30))+
+  custom_theme
+  } # updates
+
+
+if (F){
+  ggplot(sim_case_2 %>% 
+         select(model, trial, PE_pos, PE_neg) %>% 
+         gather(key = "direction", value = "PE", PE_pos, PE_neg)%>%
+          mutate(direction = factor(direction, levels = c("PE_pos", "PE_neg"))),
+       aes(x = trial, col = model))+
+  geom_line(aes(y = abs(PE))) +
+  scale_color_manual(values = model_colors)+
+  facet_grid(direction~.)+
+  labs(x = "block")+
+  lims(x = c(1,30))+
+  custom_theme
+  
+  } # PE
+
+
+```
+
+
+# Case 2 Extras {.tabset}
+
+This section presents several additional simulation scenarios used to probe the behavior of the asymmetric learning-rate model under misspecification.
+
+Across all cases, the true data generating process uses a symmetric diminishing learning-rate mechanism, while the fitted model allows for asymmetric learning rates, but misspecifies both learnng rates as fixed. The goal is to examine how such misspecification manifests under different reward environments and demonstrate that the systematit directionality of the bias in Case 2 arises from the task and fitted model structure.
+
+Three additional cases are considered:
+
+* Random reward probabilities
+
+* Opposing reward probabilities (hierarchical model)
+
+* Opposing reward probabilities (non-hierarchical model)
+
+## Random reward probabilities
+
+In this condition, each bandit’s reward probability is independently sampled from a uniform distribution over [0,1].
+This creates environments in which there may be an advantage for positive or negative biases for each subject.
+Since the fitted model is hierarchical, the bias measure tend to stick to one of the two biases. 
+
+```{r extra random subject posteriors,  fig.width=8, fig.height=4}
+
+Case_2_extra_random = readRDS(file.path(fit_dir,"Case_2_extra_asymm_random.rds"))
+bias_extra_random <- extract_subject_param(Case_2_extra_random, "bias")
+
+ggplot(bias_extra_random, aes(x = value, group = subject)) +
+  geom_density(alpha = 0.2, col = NA, fill = param_colors['bias']) + 
+  labs(x = "Bias parameter",y = "Density",fill = "Subject") +
+  custom_theme+
+  theme(legend.position = "none")
+
+```
+
+```{r extra random chains,  fig.width=8, fig.height=6}
+chosen_subjects = 1:9
+
+ggplot(bias_extra_random %>% filter(subject %in% chosen_subjects),
+       aes(x = iter, y = value, col = factor(chain))) +
+  geom_line(aes(group = interaction(subject, chain)), linewidth = 0.4, alpha = 0.5) +
+  facet_wrap(~subject) +
+  scale_y_continuous(limits = c(0, 1),breaks = c(0, 0.5, 1)) +
+  labs(x = "Iteration", y = "Bias", colour = "Chain", Title = "MCMC Chains for selected subjects") +
+  theme(legend.position = "none") +
+  custom_theme
+
+```
+
+## Opposing reward probabilities
+
+In this condition, one bandit’s reward probability is sampled from a uniform distribution, while the second is deterministically defined as its complement:
+
+$$p_2 = 1- p_1 $$
+This creates an environment where there is no advantage to any of the directionalities of bias - such that strong negative and positive bias are equally beneficial for all agents.
+Yet, the hierarchical structure of the model still causes agent-level parameters to stick primarily to one direction of bias.
+
+```{r extra opposing,  fig.width=8, fig.height=4}
+
+Case_2_extra_opposing = readRDS(file.path(fit_dir,"Case_2_extra_asymm_opposing.rds"))
+bias_extra_opposing <- extract_subject_param(Case_2_extra_opposing, "bias")
+
+ggplot(bias_extra_opposing, aes(x = value, group = subject)) +
+  geom_density(alpha = 0.2, col = NA, fill = param_colors['bias']) + 
+  labs(x = "Bias parameter",y = "Density",fill = "Subject") +
+  custom_theme+
+  theme(legend.position = "none")
+
+```
+
+```{r extra opposing chains,  fig.width=8, fig.height=6}
+
+chosen_subjects = 1:9
+
+ggplot(bias_extra_opposing %>% filter(subject %in% chosen_subjects),
+       aes(x = iter, y = value, col = factor(chain))) +
+  geom_line(aes(group = interaction(subject, chain)), linewidth = 0.4, alpha = 0.5) +
+  facet_wrap(~subject) +
+  scale_y_continuous(limits = c(0, 1),breaks = c(0, 0.5, 1)) +
+  labs(x = "Iteration", y = "Bias", colour = "Chain", Title = "MCMC Chains for selected subjects") +
+  theme(legend.position = "none") +
+  custom_theme
+
+```
+
+## No hierarchical structure
+
+In the non-hierarchical version of the same environment, subject-level parameters are estimated independently.
+
+Under this specification, posterior estimates of bias are eqaully distributed between positive and negative biases, with chains periodically "jumping" between both of these equivalent domains.
+
+
+```{r extra opposing non H,  fig.width=8, fig.height=4}
+Case_2_extra_non_H_opposing = readRDS(file.path(fit_dir,"Case_2_extra_asymm_non_H_opposing.rds"))
+bias_extra_non_H_opposing <- extract_subject_param(Case_2_extra_non_H_opposing, "bias")
+
+ggplot(bias_extra_non_H_opposing, aes(x = value, group = subject)) +
+  geom_density(alpha = 0.2, col = NA, fill = param_colors['bias']) + 
+  labs(x = "Bias parameter",y = "Density",fill = "Subject") +
+  custom_theme+
+  theme(legend.position = "none")
+
+```
+
+```{r extra opposing non H chains,  fig.width=8, fig.height=6}
+
+chosen_subjects = 1:9
+
+ggplot(bias_extra_non_H_opposing %>% filter(subject %in% chosen_subjects),
+       aes(x = iter, y = value, col = factor(chain))) +
+  geom_line(aes(group = interaction(subject, chain)), linewidth = 0.4, alpha = 0.5) +
+  facet_wrap(~subject) +
+  scale_y_continuous(limits = c(0, 1),breaks = c(0, 0.5, 1)) +
+  labs(x = "Iteration", y = "Bias", colour = "Chain", Title = "MCMC chains for selected subjects") +
+  theme(legend.position = "none") +
+  custom_theme
+
+```
+
