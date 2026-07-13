@@ -53,25 +53,25 @@ custom_theme = theme_bw(base_size = 14) +
 } # Custom Theme
 
 {
-  param_colors <- c(
+  
+
+param_colors <- c(
   lr       = "#2772ab",
   lr_pos   = "#7eb4e0",
   lr_neg   = "#0f446e",
   
-  inv_temp = "#c9939b",
+  inv_temp = "#CC79A7",
   bias     = "#69995D"
 )
-  
+
 model_colors <- c(
-  "Constant LR" = "#3ca1c9",
-  "Asymmetric LR" = "#69995D",
-  "Diminishing LR" = "#bb75f0",
+  "Constant LR" = "#D55E00",
+  "Asymmetric LR" = "#009E73",
+  "Diminishing LR" = "#762A83",
   "Random" = "grey70"
 )
 
 } # Colors
-
-
 
 
 {
@@ -129,6 +129,7 @@ inv_logit <- function(x) {
   1 / (1 + exp(-x))
 }
 } # Additional functions
+
 ```
 
 
@@ -269,7 +270,6 @@ ggplot(bf_report %>% filter(model %in% c("Diminishing LR","Constant LR")),
 
 ```
 
-
 ## Parameters {.tabset}
 
 ### Table 
@@ -358,7 +358,7 @@ plot_hdi_double = function(draw_vec_1,hdi_1,param_name_1,
 
 ```
 
-```{r fig1b,  fig.width=8, fig.height=4}
+```{r fig1c,  fig.width=8, fig.height=4}
 
 plot_hdi(Case_1_const_lr$lr, Case_1_const_lr_hdi,"lr", xlim = c(0,0.2), true_scale = c(1/30,0.2))
 
@@ -366,7 +366,7 @@ plot_hdi(Case_1_const_lr$lr, Case_1_const_lr_hdi,"lr", xlim = c(0,0.2), true_sca
 
 ```
 
-```{r fig1c,  fig.width=8, fig.height=4}
+```{r fig1d,  fig.width=8, fig.height=4}
 
 plot_hdi(Case_1_const_inv_temp$inv_temp, Case_1_const_inv_temp_hdi,"inv_temp", true_scale = c(0.2,0.2*30))
 
@@ -413,7 +413,7 @@ PPC1_trial_summ = PPC1_data %>%
 
 ```
 
-# Stay Probability
+### Stay Probability
 
 ```{r PPC1_stay, fig.width=8, fig.height=4}
 stay_ppc_case_1 = readRDS(file = file.path(RDS_dir,"stay_ppc_case_1.rds"))
@@ -571,7 +571,7 @@ plot_hdi(Case_2_asymm_bias$bias, Case_2_asymm_bias_hdi,"bias", xlim = c(0,1))+
 
 ### Accuracy
 
-```{r PPC2_acc, fig.width=8, fig.height=4}
+```{r fig2d PPC, fig.width=8, fig.height=4}
 acc_ppc_case_2 = readRDS(file = file.path(RDS_dir,"acc_ppc_case_2.rds"))
 
 {
@@ -611,7 +611,7 @@ PPC2_trial_summ = PPC2_data %>%
 
 ### Stay probability
 
-```{r PPC2_stay, fig.width=8, fig.height=4}
+```{r fig2e PPC, fig.width=8, fig.height=4}
 stay_ppc_case_2 = readRDS(file = file.path(RDS_dir,"stay_ppc_case_2.rds"))
 
 {
@@ -643,7 +643,7 @@ true_stay_p_case_2 = Case_2_data %>%
 
 ## Simulations
 
-```{r Fig2ef , fig.width= 5, fig.height=5}
+```{r Fig2fg , fig.width= 5, fig.height=5}
 
 sim_case_2 = readRDS(file.path(RDS_dir,"sim_case_2.rds")) %>%
   mutate(model = factor(model, labels = c("Asymmetric LR","Constant LR","Diminishing LR")))
